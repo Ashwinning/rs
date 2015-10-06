@@ -71,13 +71,54 @@ convertPoint (const PXCPoint3DF32& src, T& tgt)
   }
 }
 
+pcl::RealSenseGrabber::Mode::Mode ()
+: fps (0), depth_width (0), depth_height (0), color_width (0), color_height (0)
+{
+}
 
-pcl::RealSenseGrabber::RealSenseGrabber (const std::string& device_id)
+pcl::RealSenseGrabber::Mode::Mode (unsigned int f)
+: fps (f), depth_width (0), depth_height (0), color_width (0), color_height (0)
+{
+}
+
+pcl::RealSenseGrabber::Mode::Mode (unsigned int dw, unsigned int dh)
+: fps (0), depth_width (dw), depth_height (dh), color_width (0), color_height (0)
+{
+}
+
+pcl::RealSenseGrabber::Mode::Mode (unsigned int f, unsigned int dw, unsigned int dh)
+: fps (f), depth_width (dw), depth_height (dh), color_width (0), color_height (0)
+{
+}
+
+pcl::RealSenseGrabber::Mode::Mode (unsigned int dw, unsigned int dh, unsigned int cw, unsigned int ch)
+: fps (0), depth_width (dw), depth_height (dh), color_width (cw), color_height (ch)
+{
+}
+
+pcl::RealSenseGrabber::Mode::Mode (unsigned int f, unsigned int dw, unsigned int dh, unsigned int cw, unsigned int ch)
+: fps (f), depth_width (dw), depth_height (dh), color_width (cw), color_height (ch)
+{
+}
+
+bool
+operator== (const pcl::RealSenseGrabber::Mode& m1, const pcl::RealSenseGrabber::Mode& m2)
+{
+  return (m1.fps == m2.fps &&
+          m1.depth_width == m2.depth_width &&
+          m1.depth_height == m2.depth_height &&
+          m1.color_width == m2.color_width &&
+          m1.color_height == m2.color_height);
+}
+
+pcl::RealSenseGrabber::RealSenseGrabber (const std::string& device_id, const Mode& mode, bool strict)
 : Grabber ()
 , is_running_ (false)
 , confidence_threshold_ (6)
 , temporal_filtering_type_ (RealSense_None)
-, depth_buffer_ (new pcl::io::SingleBuffer<unsigned short> (SIZE))
+, temporal_filtering_window_size_ (1)
+, mode_requested_ (mode)
+, strict_ (strict)
 {
   if (device_id == "")
     device_ = RealSenseDeviceManager::getInstance ()->captureDevice ();
@@ -107,31 +148,29 @@ pcl::RealSenseGrabber::start ()
     need_xyzrgba_ = num_slots<sig_cb_real_sense_point_cloud_rgba> () > 0;
     if (need_xyz_ || need_xyzrgba_)
     {
-      frequency_.reset ();
-      is_running_ = true;
+      selectMode ();
       PXCCapture::Device::StreamProfileSet profile;
       memset (&profile, 0, sizeof (profile));
-      // TODO: this should depend on Mode
-      profile.depth.frameRate.max = 30;
-      profile.depth.frameRate.min = 30;
-      profile.depth.imageInfo.width = WIDTH;
-      profile.depth.imageInfo.height = HEIGHT;
+      profile.depth.frameRate.max = mode_selected_.fps;
+      profile.depth.frameRate.min = mode_selected_.fps;
+      profile.depth.imageInfo.width = mode_selected_.depth_width;
+      profile.depth.imageInfo.height = mode_selected_.depth_height;
       profile.depth.imageInfo.format = PXCImage::PIXEL_FORMAT_DEPTH;
       profile.depth.options = PXCCapture::Device::STREAM_OPTION_ANY;
       if (need_xyzrgba_)
       {
-        profile.color.frameRate.max = 30;
-        profile.color.frameRate.min = 30;
-        profile.color.imageInfo.width = COLOR_WIDTH;
-        profile.color.imageInfo.height = COLOR_HEIGHT;
+        profile.color.frameRate.max = mode_selected_.fps;
+        profile.color.frameRate.min = mode_selected_.fps;
+        profile.color.imageInfo.width = mode_selected_.color_width;
+        profile.color.imageInfo.height = mode_selected_.color_height;
         profile.color.imageInfo.format = PXCImage::PIXEL_FORMAT_RGB32;
         profile.color.options = PXCCapture::Device::STREAM_OPTION_ANY;
       }
       device_->getPXCDevice ().SetStreamProfileSet (&profile);
-      bool valid = device_->getPXCDevice ().IsStreamProfileSetValid (&profile);
-      if (!valid)
-        THROW_IO_EXCEPTION ("invalid stream profile for PXC device");
-
+      if (!device_->getPXCDevice ().IsStreamProfileSetValid (&profile))
+        THROW_IO_EXCEPTION ("Invalid stream profile for PXC device");
+      frequency_.reset ();
+      is_running_ = true;
       thread_ = boost::thread (&RealSenseGrabber::run, this);
     }
   }
@@ -178,33 +217,15 @@ void
 pcl::RealSenseGrabber::enableTemporalFiltering (TemporalFilteringType type, size_t window_size)
 {
   if (temporal_filtering_type_ != type ||
-     (type != RealSense_None && depth_buffer_->size () != window_size))
+     (type != RealSense_None && temporal_filtering_window_size_ != window_size))
   {
-    bool was_running = is_running_;
-    if (was_running)
-      stop ();
-    switch (type)
-    {
-      case RealSense_None:
-        {
-          depth_buffer_.reset (new pcl::io::SingleBuffer<unsigned short> (SIZE));
-          break;
-        }
-      case RealSense_Median:
-        {
-          // TODO: MedianFilter freezes on destructor, investigate
-          depth_buffer_.reset (new pcl::io::MedianBuffer<unsigned short> (SIZE, window_size));
-          break;
-        }
-      case RealSense_Average:
-        {
-          depth_buffer_.reset (new pcl::io::AverageBuffer<unsigned short> (SIZE, window_size));
-          break;
-        }
-    }
     temporal_filtering_type_ = type;
-    if (was_running)
+    temporal_filtering_window_size_ = window_size;
+    if (is_running_)
+    {
+      stop ();
       start ();
+    }
   }
 }
 
@@ -220,12 +241,65 @@ pcl::RealSenseGrabber::getDeviceSerialNumber () const
   return (device_->getSerialNumber ());
 }
 
+std::vector<pcl::RealSenseGrabber::Mode>
+pcl::RealSenseGrabber::getAvailableModes (bool only_depth) const
+{
+  std::vector<Mode> modes;
+  PXCCapture::StreamType streams = only_depth
+    ? PXCCapture::STREAM_TYPE_DEPTH
+    : PXCCapture::STREAM_TYPE_DEPTH | PXCCapture::STREAM_TYPE_COLOR;
+  for (int p = 0;; p++)
+  {
+    PXCCapture::Device::StreamProfileSet profiles = {};
+    if (device_->getPXCDevice ().QueryStreamProfileSet (streams, p, &profiles) == PXC_STATUS_NO_ERROR)
+    {
+      if (!only_depth && profiles.depth.frameRate.max != profiles.color.frameRate.max)
+        continue; // we need both streams to have the same framerate
+      Mode mode;
+      mode.fps = profiles.depth.frameRate.max;
+      mode.depth_width = profiles.depth.imageInfo.width;
+      mode.depth_height = profiles.depth.imageInfo.height;
+      mode.color_width = profiles.color.imageInfo.width;
+      mode.color_height = profiles.color.imageInfo.height;
+      bool duplicate = false;
+      for (size_t i = 0; i < modes.size (); ++i)
+        duplicate |= modes[i] == mode;
+      if (!duplicate)
+        modes.push_back (mode);
+    }
+    else
+    {
+      break;
+    }
+  }
+  return modes;
+}
+
+void
+pcl::RealSenseGrabber::setMode (const Mode& mode, bool strict)
+{
+  if (mode == mode_requested_ && strict == strict_)
+    return;
+  mode_requested_ = mode;
+  strict_ = strict;
+  if (is_running_)
+  {
+    stop ();
+    start ();
+  }
+}
+
 void
 pcl::RealSenseGrabber::run ()
 {
+  const int WIDTH = mode_selected_.depth_width;
+  const int HEIGHT = mode_selected_.depth_height;
+  const int SIZE = WIDTH * HEIGHT;
+
   PXCProjection* projection = device_->getPXCDevice ().CreateProjection ();
   PXCCapture::Sample sample;
   std::vector<PXCPoint3DF32> vertices (SIZE);
+  createDepthBuffer ();
 
   while (is_running_)
   {
@@ -340,4 +414,69 @@ pcl::RealSenseGrabber::run ()
   std::string id = device_->getSerialNumber ();
   device_.reset ();
   device_ = RealSenseDeviceManager::getInstance ()->captureDevice (id);
+}
+
+float
+pcl::RealSenseGrabber::computeModeScore (const Mode& mode)
+{
+  const float FPS_WEIGHT = 100000;
+  const float DEPTH_WEIGHT = 1000;
+  const float COLOR_WEIGHT = 1;
+  int f = mode.fps - mode_requested_.fps;
+  int dw = mode.depth_width - mode_requested_.depth_width;
+  int dh = mode.depth_height - mode_requested_.depth_height;
+  int cw = mode.color_width - mode_requested_.color_width;
+  int ch = mode.color_height - mode_requested_.color_height;
+  float penalty;
+  penalty  = std::abs (FPS_WEIGHT * f * (mode_requested_.fps != 0));
+  penalty += std::abs (DEPTH_WEIGHT * dw * (mode_requested_.depth_width != 0));
+  penalty += std::abs (DEPTH_WEIGHT * dh * (mode_requested_.depth_height != 0));
+  penalty += std::abs (COLOR_WEIGHT * cw * (mode_requested_.color_width != 0 && need_xyzrgba_));
+  penalty += std::abs (COLOR_WEIGHT * ch * (mode_requested_.color_height != 0 && need_xyzrgba_));
+  return penalty;
+}
+
+void
+pcl::RealSenseGrabber::selectMode ()
+{
+  if (mode_requested_ == Mode ())
+    mode_requested_ = Mode (30, 640, 480, 640, 480);
+  float best_score = std::numeric_limits<float>::max ();
+  std::vector<Mode> modes = getAvailableModes (!need_xyzrgba_);
+  for (size_t i = 0; i < modes.size (); ++i)
+  {
+    Mode mode = modes[i];
+    float score = computeModeScore (mode);
+    if (score < best_score)
+    {
+      best_score = score;
+      mode_selected_ = mode;
+    }
+  }
+  if (strict_ && best_score > 0)
+    THROW_IO_EXCEPTION ("PXC device does not support requested mode");
+}
+
+void
+pcl::RealSenseGrabber::createDepthBuffer ()
+{
+  size_t size = mode_selected_.depth_width * mode_selected_.depth_height;
+  switch (temporal_filtering_type_)
+  {
+  case RealSense_None:
+  {
+    depth_buffer_.reset (new pcl::io::SingleBuffer<unsigned short> (size));
+    break;
+  }
+  case RealSense_Median:
+  {
+    depth_buffer_.reset (new pcl::io::MedianBuffer<unsigned short> (size, temporal_filtering_window_size_));
+    break;
+  }
+  case RealSense_Average:
+  {
+    depth_buffer_.reset (new pcl::io::AverageBuffer<unsigned short> (size, temporal_filtering_window_size_));
+    break;
+  }
+  }
 }
