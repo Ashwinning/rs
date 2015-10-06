@@ -21,7 +21,8 @@ find_path(RSSDK_DIR include/pxcversion.h
 if(RSSDK_DIR)
 
   # Include directories
-  set(RSSDK_INCLUDE_DIRS ${RSSDK_DIR}/include)
+  #set(RSSDK_INCLUDE_DIRS ${RSSDK_DIR}/include)
+  set(RSSDK_INCLUDE_DIRS ${RSSDK_DIR}/opensource/include)
   mark_as_advanced(RSSDK_INCLUDE_DIRS)
   
   # Libraries
